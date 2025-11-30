@@ -32,5 +32,23 @@ services:
     volumes:
       - ./training-service:/var/www/html
 
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - "8000:80"
+    networks:
+      - rebuilder-network
+    depends_on:
+      - training-service
+
+  text-to-speech-service:
+    build: ./text-to-speech-service
+    ports:
+      - "8002:80"
+    networks:
+      - rebuilder-network
+    environment:
+      - MURF_API_KEY=ap2_c41bf1a3-3c79-4734-936f-f2c717640d90
+
 volumes:
   training_data:
