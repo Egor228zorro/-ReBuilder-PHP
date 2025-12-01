@@ -1,6 +1,22 @@
+# PHP
 vendor/
+composer.lock
+
+# Environment
 .env
-.DS_Store
+
+# IDE
 .idea/
+.vscode/
+*.swp
+
+# Logs
 *.log
-docker-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+!Dockerfile
+!docker-compose.yml

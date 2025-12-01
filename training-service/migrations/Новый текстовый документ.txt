@@ -1,0 +1,35 @@
+<?php
+require_once 'vendor/autoload.php';
+
+use Rebuilder\Training\Database\DatabaseConnection;
+use Rebuilder\Training\Service\WorkoutService;
+
+echo "=== ТЕСТ WorkoutService ===\n\n";
+
+try {
+    $db = DatabaseConnection::getInstance()->getConnection();
+    $service = new WorkoutService($db);
+    
+    // Получаем все тренировки
+    echo "1. Все тренировки:\n";
+    $workouts = $service->getAllWorkouts();
+    foreach ($workouts as $w) {
+        echo "   - [{$w['type']}] {$w['name']}\n";
+    }
+    
+    // Получаем упражнения для первой тренировки
+    if (!empty($workouts)) {
+        $firstWorkout = $workouts[0];
+        echo "\n2. Упражнения для '{$firstWorkout['name']}':\n";
+        
+        $exercises = $service->getWorkoutExercises($firstWorkout['id']);
+        foreach ($exercises as $e) {
+            echo "   - {$e['name']} ({$e['duration_seconds']} сек)\n";
+        }
+    }
+    
+    echo "\n✅ Сервис работает!\n";
+    
+} catch (Exception $e) {
+    echo "❌ Ошибка: " . $e->getMessage() . "\n";
+}

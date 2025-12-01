@@ -17,10 +17,10 @@ class Application
         $this->app = AppFactory::create();
         $this->httpClient = new Client();
         
-        $this->setupGatewayRoutes();
+        $this->setupRoutes();
     }
 
-    private function setupGatewayRoutes(): void
+    private function setupRoutes(): void
     {
         // Health check
         $this->app->get('/health', function (Request $request, Response $response) {
@@ -59,9 +59,26 @@ class Application
     private function proxyToService(Request $request, Response $response, string $serviceUrl)
     {
         try {
+            // === ОТЛАДКА ===
+            error_log("=== API GATEWAY DEBUG ===");
+            error_log("Method: " . $request->getMethod());
+            error_log("Path: " . $request->getUri()->getPath());
+            error_log("Content-Type: " . ($request->getHeaderLine('Content-Type') ?? 'none'));
+            
+            $bodyContent = $request->getBody()->getContents();
+            error_log("Body size: " . strlen($bodyContent));
+            error_log("Body content: " . $bodyContent);
+            // === КОНЕЦ ОТЛАДКИ ===
+
             $path = $request->getUri()->getPath();
             $method = $request->getMethod();
             $query = $request->getUri()->getQuery();
+            
+            // Убираем префиксы для TTS сервиса
+            if (str_starts_with($path, '/tts')) {
+                $path = str_replace('/tts', '', $path);
+                $path = $path ?: '/';
+            }
             
             // Формируем URL для целевого сервиса
             $targetUrl = $serviceUrl . $path;
@@ -69,23 +86,37 @@ class Application
                 $targetUrl .= '?' . $query;
             }
             
-            // Проксируем запрос
-            $serviceResponse = $this->httpClient->request($method, $targetUrl, [
+            // Подготавливаем опции для Guzzle
+            $options = [
                 'headers' => $request->getHeaders(),
-                'body' => $request->getBody(),
                 'timeout' => 30
-            ]);
+            ];
             
-            // Получаем содержимое ответа как строку
-            $responseBody = $serviceResponse->getBody()->getContents();
+            // Добавляем тело запроса для POST/PUT методов
+            if (in_array($method, ['POST', 'PUT', 'PATCH']) && !empty($bodyContent)) {
+                $options['body'] = $bodyContent;
+                $options['headers']['Content-Type'] = 'application/json';
+            }
+            
+            // Проксируем запрос
+            $serviceResponse = $this->httpClient->request($method, $targetUrl, $options);
             
             // Возвращаем ответ от целевого сервиса
-            $response->getBody()->write($responseBody);
+            $response->getBody()->write($serviceResponse->getBody()->getContents());
             return $response
                 ->withStatus($serviceResponse->getStatusCode())
                 ->withHeader('Content-Type', 'application/json');
                 
-        } catch (\Exception $e) {
+        } catch (\GuzzleHttp\Exception\RequestException $e) {
+            // Обрабатываем ошибки запроса
+            if ($e->hasResponse()) {
+                $errorResponse = $e->getResponse();
+                $response->getBody()->write($errorResponse->getBody()->getContents());
+                return $response
+                    ->withStatus($errorResponse->getStatusCode())
+                    ->withHeader('Content-Type', 'application/json');
+            }
+            
             $response->getBody()->write(json_encode([
                 'error' => 'Service unavailable',
                 'message' => $e->getMessage(),

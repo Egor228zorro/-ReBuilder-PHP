@@ -8,7 +8,7 @@ services:
     environment:
       POSTGRES_DB: training_db
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: password  # изменено на password
     ports:
       - "5432:5432"
     volumes:
@@ -24,7 +24,7 @@ services:
       - DB_HOST=training-db
       - DB_NAME=training_db
       - DB_USER=postgres
-      - DB_PASS=postgres
+      - DB_PASS=password  # изменено на password
     depends_on:
       - training-db
     networks:
@@ -40,7 +40,9 @@ services:
       - rebuilder-network
     depends_on:
       - training-service
-
+      - text-to-speech-service
+    volumes:
+      - ./api-gateway:/var/www/html  # ← ДОБАВЬ ЭТУ СТРОКУ
   text-to-speech-service:
     build: ./text-to-speech-service
     ports:

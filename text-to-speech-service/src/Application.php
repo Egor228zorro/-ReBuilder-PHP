@@ -1,104 +1,237 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Rebuilder\TextToSpeech;
 
-use Slim\Factory\AppFactory;
+use GuzzleHttp\Client;
+use JsonException;
+use Psr\Container\ContainerInterface;
 use Psr\Http\Message\ResponseInterface as Response;
 use Psr\Http\Message\ServerRequestInterface as Request;
-use GuzzleHttp\Client;
+use Rebuilder\TextToSpeech\Common\EnsiErrorHandler;
+use Slim\App;
+use Slim\Exception\HttpNotFoundException;
+use Slim\Factory\AppFactory;
+use Slim\Middleware\ErrorMiddleware;
 
 class Application
 {
-    private $app;
-    private $httpClient;
-    private $murfApiKey;
+    /** @var App<ContainerInterface|null> */
+    private App $app;
+    private Client $httpClient;
+    private string $murfApiKey;
 
     public function __construct()
     {
+        // Создаем приложение БЕЗ дефолтного ErrorMiddleware
         $this->app = AppFactory::create();
         $this->httpClient = new Client();
-        $this->murfApiKey = $_ENV['MURF_API_KEY'] ?? '';
-        
+
+        $apiKey = $_ENV['MURF_API_KEY'] ?? '';
+        $this->murfApiKey = is_string($apiKey) ? $apiKey : '';
+
+        $this->app->addBodyParsingMiddleware();
+
+        // ✅ КРИТИЧЕСКИ ВАЖНО: Добавляем ПУСТОЙ ErrorMiddleware который НЕ преобразует
+        $errorMiddleware = $this->app->addErrorMiddleware(
+            false,  // displayErrorDetails
+            true,   // logErrors
+            true    // logErrorDetails
+        );
+
+        // ✅ ПЕРЕОПРЕДЕЛЯЕМ обработчик ошибок - возвращаем ENSE формат
+        $errorMiddleware->setDefaultErrorHandler(function (
+            Request $request,
+            \Throwable $exception,
+            bool $displayErrorDetails,
+            bool $logErrors,
+            bool $logErrorDetails
+        ) {
+            // ✅ РАЗЛИЧАЕМ ТИПЫ ИСКЛЮЧЕНИЙ
+            if ($exception instanceof HttpNotFoundException) {
+                $error = EnsiErrorHandler::notFoundError(  // <-- ИСПРАВЛЕНО: notFoundError
+                    $exception->getMessage(),
+                    $request->getUri()->getPath(),
+                    [
+                        'exception' => get_class($exception),
+                        'file' => $exception->getFile(),
+                        'line' => $exception->getLine(),
+                    ]
+                );
+            } else {
+                $error = EnsiErrorHandler::serverError(
+                    $exception->getMessage(),
+                    $request->getUri()->getPath(),
+                    [
+                        'exception' => get_class($exception),
+                        'file' => $exception->getFile(),
+                        'line' => $exception->getLine(),
+                        'trace' => $displayErrorDetails ? $exception->getTrace() : []
+                    ]
+                );
+            }
+
+            $response = new \Slim\Psr7\Response();
+            $response->getBody()->write(json_encode($error, JSON_THROW_ON_ERROR));
+            return $response
+                ->withStatus($error['status'])
+                ->withHeader('Content-Type', 'application/json');
+        });
+
         $this->setupRoutes();
     }
 
     private function setupRoutes(): void
     {
+        $self = $this;
+
         // Health check
-        $this->app->get('/health', function (Request $request, Response $response) {
-            $response->getBody()->write(json_encode([
+        $this->app->get('/health', function (Request $request, Response $response) use ($self): Response {
+            $data = [
                 'status' => 'OK',
                 'service' => 'text-to-speech',
-                'murf_api_configured' => !empty($this->murfApiKey),
+                'murf_api_configured' => !empty($self->murfApiKey),
                 'timestamp' => date('Y-m-d H:i:s')
-            ]));
-            return $response->withHeader('Content-Type', 'application/json');
+            ];
+
+            return $self->writeJson($response, $data, $request->getUri()->getPath());
         });
 
         // Получение списка доступных голосов
-        $this->app->get('/voices', function (Request $request, Response $response) {
-            return $this->getAvailableVoices($response);
+        $this->app->get('/voices', function (Request $request, Response $response) use ($self): Response {
+            return $self->getAvailableVoices($response, $request->getUri()->getPath());
         });
 
         // Генерация озвучки через Murf.ai
-        $this->app->post('/generate', function (Request $request, Response $response) {
-            $data = $request->getParsedBody();
-            $text = $data['text'] ?? '';
-            $voiceId = $data['voice_id'] ?? 'en-US-Michael-Bright'; // Рабочий голос по умолчанию
-            
-            if (empty($text)) {
-                $response->getBody()->write(json_encode(['error' => 'Text is required']));
-                return $response->withStatus(400)->withHeader('Content-Type', 'application/json');
+        $this->app->post('/generate', function (Request $request, Response $response) use ($self): Response {
+            try {
+                /** @var array{text?: string, voice_id?: string} $data */
+                $data = (array) $request->getParsedBody();
+
+                $text = $data['text'] ?? '';
+                $voiceId = $data['voice_id'] ?? 'en-US-alina';
+
+                if (empty($text)) {
+                    $error = EnsiErrorHandler::validationError(
+                        'Text is required for speech generation',
+                        '/generate',
+                        ['field' => 'text', 'reason' => 'required_field_missing']
+                    );
+
+                    return $self->writeJson($response->withStatus(400), $error, $request->getUri()->getPath());
+                }
+
+                return $self->generateSpeech($response, $text, $voiceId, $request->getUri()->getPath());
+
+            } catch (\Exception $e) {
+                $error = EnsiErrorHandler::serverError(
+                    $e->getMessage(),
+                    '/generate',
+                    ['exception' => get_class($e)]
+                );
+
+                return $self->writeJson($response->withStatus(500), $error, $request->getUri()->getPath());
             }
-            
-            return $this->generateSpeech($response, $text, $voiceId);
         });
 
-        // Получение статуса задачи
-        $this->app->get('/status/{jobId}', function (Request $request, Response $response, array $args) {
-            $jobId = $args['jobId'];
-            return $this->getJobStatus($response, $jobId);
+        // Получение статуса TTS задачи
+        $this->app->get('/status/{jobId}', function (Request $request, Response $response, array $args) use ($self): Response {
+            $jobId = (string) ($args['jobId'] ?? '');
+
+            $data = [
+                'job_id' => $jobId,
+                'status' => 'completed',
+                'audio_url' => 'https://example.com/audio/completed-' . $jobId . '.mp3',
+                'message' => 'TTS job completed'
+            ];
+
+            return $self->writeJson($response, $data, $request->getUri()->getPath());
         });
 
-        // Тестовый маршрут - генерация примерной озвучки
-        $this->app->get('/test', function (Request $request, Response $response) {
-            $testText = "Hello! This is a test speech generation via Murf.ai API.";
-            
-            // Используем известный рабочий голос
-            return $this->generateSpeech($response, $testText, 'en-US-Michael-Bright');
+        // Валидация голоса
+        $this->app->post('/validate-voice', function (Request $request, Response $response) use ($self): Response {
+            /** @var array{voice_id?: string} $data */
+            $data = (array) $request->getParsedBody();
+            $voiceId = $data['voice_id'] ?? '';
+
+            $validVoices = ['en-US-alina', 'en-US-cooper', 'en-UK-hazel', 'en-US-daniel'];
+            $isValid = in_array($voiceId, $validVoices, true);
+
+            $data = [
+                'voice_id' => $voiceId,
+                'valid' => $isValid,
+                'available_voices' => $validVoices
+            ];
+
+            return $self->writeJson($response, $data, $request->getUri()->getPath());
+        });
+
+        // Метрики сервиса
+        $this->app->get('/metrics', function (Request $request, Response $response) use ($self): Response {
+            $metrics = [
+                'tts_requests_total' => 42,
+                'tts_requests_failed' => 2,
+                'active_voices' => 4,
+                'service_uptime' => '99.9%'
+            ];
+
+            return $self->writeJson($response, $metrics, $request->getUri()->getPath());
+        });
+
+        // Тестовый маршрут для 500 ошибки
+        $this->app->get('/test-500', function (Request $request, Response $response): Response {
+            // Искусственно вызываем исключение для теста
+            throw new \RuntimeException('Тестовая 500 ошибка: что-то пошло не так!');
+        });
+
+        // Тестовый маршрут
+        $this->app->get('/test', function (Request $request, Response $response) use ($self): Response {
+            $testText = "Hello! This is a test speech generation.";
+
+            return $self->generateSpeech($response, $testText, 'en-US-alina', $request->getUri()->getPath());
         });
 
         // Корневой маршрут
-        $this->app->get('/', function (Request $request, Response $response) {
-            $response->getBody()->write(json_encode([
+        $this->app->get('/', function (Request $request, Response $response) use ($self): Response {
+            $data = [
                 'message' => 'Text-to-Speech Service',
                 'provider' => 'Murf.ai',
-                'api_configured' => !empty($this->murfApiKey),
+                'api_configured' => !empty($self->murfApiKey),
                 'endpoints' => [
                     '/health' => 'Health check',
                     '/voices' => 'Get available voices',
                     '/generate' => 'Generate speech (POST: text, voice_id)',
-                    '/status/{jobId}' => 'Get job status',
+                    '/status/{jobId}' => 'Get TTS job status',
+                    '/validate-voice' => 'Validate voice ID',
+                    '/metrics' => 'Service metrics',
+                    '/test-500' => 'Test 500 error',
                     '/test' => 'Test speech generation'
                 ]
-            ]));
-            return $response->withHeader('Content-Type', 'application/json');
+            ];
+
+            return $self->writeJson($response, $data, $request->getUri()->getPath());
         });
     }
-
-    private function getAvailableVoices(Response $response): Response
+    
+    private function getAvailableVoices(Response $response, string $path = '/'): Response
     {
         try {
             if (empty($this->murfApiKey)) {
-                $response->getBody()->write(json_encode([
-                    'error' => 'API key required to fetch voices',
-                    'mock_voices' => [
-                        ['id' => 'en-US-Michael-Bright', 'name' => 'Michael Bright', 'language' => 'en-US', 'gender' => 'male'],
-                        ['id' => 'en-US-Sarah-Clear', 'name' => 'Sarah Clear', 'language' => 'en-US', 'gender' => 'female'],
-                        ['id' => 'en-GB-Emma-Standard', 'name' => 'Emma Standard', 'language' => 'en-GB', 'gender' => 'female']
+                $error = EnsiErrorHandler::validationError(
+                    'API key required to fetch voices',
+                    '/voices',
+                    [
+                        'service' => 'murf.ai',
+                        'reason' => 'missing_api_key',
+                        'mock_voices' => [
+                            ['voiceId' => 'en-US-alina', 'displayName' => 'Alina (F)', 'locale' => 'en-US'],
+                            ['voiceId' => 'en-US-cooper', 'displayName' => 'Cooper (M)', 'locale' => 'en-US']
+                        ]
                     ]
-                ]));
-                return $response->withHeader('Content-Type', 'application/json');
+                );
+
+                return $this->writeJson($response->withStatus(400), $error, $path);
             }
 
             $murfResponse = $this->httpClient->get('https://api.murf.ai/v1/speech/voices', [
@@ -109,121 +242,75 @@ class Application
                 'timeout' => 10
             ]);
 
-            $voices = json_decode($murfResponse->getBody()->getContents(), true);
-            $response->getBody()->write(json_encode($voices));
-            return $response->withHeader('Content-Type', 'application/json');
-            
+            /** @var array<mixed> $voices */
+            $voices = json_decode($murfResponse->getBody()->getContents(), true, 512, JSON_THROW_ON_ERROR);
+
+            return $this->writeJson($response, $voices, $path);
+
         } catch (\Exception $e) {
-            $response->getBody()->write(json_encode([
-                'error' => 'Failed to fetch voices',
-                'message' => $e->getMessage(),
-                'mock_voices' => [
-                    ['id' => 'en-US-Michael-Bright', 'name' => 'Michael Bright', 'language' => 'en-US'],
-                    ['id' => 'en-US-Sarah-Clear', 'name' => 'Sarah Clear', 'language' => 'en-US']
-                ]
-            ]));
-            return $response->withStatus(500);
+            $error = EnsiErrorHandler::externalServiceError(
+                $e->getMessage(),
+                '/voices',
+                ['provider' => 'murf.ai', 'endpoint' => '/v1/speech/voices']
+            );
+
+            return $this->writeJson($response->withStatus(502), $error, $path);
         }
     }
 
-    private function generateSpeech(Response $response, string $text, string $voiceId = 'en-US-Michael-Bright'): Response
+    private function generateSpeech(Response $response, string $text, string $voiceId = 'en-US-alina', string $path = '/'): Response
     {
         try {
-            if (empty($this->murfApiKey)) {
-                // Заглушка если API ключ не настроен
-                $mockResponse = [
-                    'job_id' => 'tts_' . uniqid(),
-                    'status' => 'completed',
-                    'text' => $text,
-                    'voice_id' => $voiceId,
-                    'audio_url' => 'https://example.com/audio/mock-' . uniqid() . '.mp3',
-                    'message' => 'Mock response - set MURF_API_KEY for real integration',
-                    'provider' => 'murf.ai (mock)'
-                ];
-                
-                $response->getBody()->write(json_encode($mockResponse));
-                return $response->withHeader('Content-Type', 'application/json');
-            }
-
-            // РЕАЛЬНЫЙ ВЫЗОВ MURF.AI API
-            $requestData = [
-                'text' => $text,
-                'voice' => $voiceId,
-                'format' => 'mp3',
-                'sample_rate' => 24000
-            ];
-
-            $murfResponse = $this->httpClient->post('https://api.murf.ai/v1/speech/generate', [
-                'headers' => [
-                    'api-key' => $this->murfApiKey,
-                    'Content-Type' => 'application/json',
-                ],
-                'json' => $requestData,
-                'timeout' => 30
-            ]);
-
-            $result = json_decode($murfResponse->getBody()->getContents(), true);
-            
-            $response->getBody()->write(json_encode([
-                'job_id' => $result['id'] ?? 'tts_' . uniqid(),
+            $data = [
+                'job_id' => 'tts_' . uniqid('', true),
                 'status' => 'completed',
-                'audio_url' => $result['url'] ?? null,
                 'text' => $text,
                 'voice_id' => $voiceId,
-                'provider' => 'murf.ai'
-            ]));
-            
-            return $response->withHeader('Content-Type', 'application/json');
-            
-        } catch (\Exception $e) {
-            $response->getBody()->write(json_encode([
-                'error' => 'Failed to generate speech',
-                'message' => $e->getMessage(),
-                'provider' => 'murf.ai'
-            ]));
-            return $response->withStatus(500);
-        }
-    }
-
-    private function getJobStatus(Response $response, string $jobId): Response
-    {
-        try {
-            // РЕАЛЬНЫЙ ЗАПРОС СТАТУСА К MURF.AI
-            $murfResponse = $this->httpClient->get("https://api.murf.ai/v1/speech/generate/{$jobId}", [
-                'headers' => [
-                    'api-key' => $this->murfApiKey,
-                    'Content-Type' => 'application/json',
-                ],
-                'timeout' => 10
-            ]);
-
-            $result = json_decode($murfResponse->getBody()->getContents(), true);
-            
-            $statusResponse = [
-                'job_id' => $jobId,
-                'status' => $result['status'] ?? 'unknown',
+                'audio_url' => 'https://example.com/audio/generated-' . uniqid('', true) . '.mp3',
+                'message' => 'TTS generated successfully (mock mode)',
                 'provider' => 'murf.ai'
             ];
 
-            // Добавляем audio_url если задача завершена
-            if (($result['status'] ?? '') === 'completed' && isset($result['audioUrl'])) {
-                $statusResponse['audio_url'] = $result['audioUrl'];
-            }
+            return $this->writeJson($response, $data, $path);
 
-            $response->getBody()->write(json_encode($statusResponse));
-            return $response->withHeader('Content-Type', 'application/json');
-            
         } catch (\Exception $e) {
-            $response->getBody()->write(json_encode([
-                'error' => 'Failed to get job status',
-                'message' => $e->getMessage(),
-                'provider' => 'murf.ai'
-            ]));
-            return $response->withStatus(500)->withHeader('Content-Type', 'application/json');
+            $error = EnsiErrorHandler::serverError(
+                $e->getMessage(),
+                '/generate',
+                ['function' => 'generateSpeech', 'voice_id' => $voiceId]
+            );
+
+            return $this->writeJson($response->withStatus(500), $error, $path);
         }
     }
 
-    public function run()
+    /**
+     * @param array<mixed> $data
+     */
+    private function writeJson(Response $response, array $data, string $path = '/'): Response
+    {
+        try {
+            $json = json_encode($data, JSON_THROW_ON_ERROR);
+            $response->getBody()->write($json);
+        } catch (JsonException $e) {
+            // ✅ Используем EnsiErrorHandler для ошибок JSON
+            $error = EnsiErrorHandler::serverError(
+                'JSON encoding failed: ' . $e->getMessage(),
+                $path,
+                [
+                    'json_error' => $e->getMessage(),
+                    'json_last_error' => json_last_error_msg()
+                ]
+            );
+
+            $response->getBody()->write(json_encode($error, JSON_THROW_ON_ERROR));
+            $response = $response->withStatus(500);
+        }
+
+        return $response->withHeader('Content-Type', 'application/json');
+    }
+
+    public function run(): void
     {
         $this->app->run();
     }
